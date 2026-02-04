@@ -6,6 +6,7 @@ import pycountry
 import datetime
 import requests
 import os
+import uuid
 
 # ---- MUST COME FIRST ----
 st.set_page_config(page_title="SpectraGuru Auth Test")
@@ -61,6 +62,70 @@ def get_db_connection():
         host="localhost",
         port="5432"
     )
+
+def to_sql_literal(value):
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, datetime.date):
+        return f"'{value.isoformat()}'"
+    escaped = str(value).replace("'", "''")
+    return f"'{escaped}'"
+
+def build_spectrum_dump_sql(
+    dump_id,
+    batch_standard_id,
+    spectrum_standard_id,
+    spectrum_data_standard_start_id,
+    spectrum_name,
+    spectrum_df
+):
+    sql_lines = [
+        "-- SpectraGuru SQL dump",
+        f"-- dump_id: {dump_id}",
+        f"-- generated_at_utc: {datetime.datetime.utcnow().isoformat()}",
+        "BEGIN;",
+        (
+            "INSERT INTO spectrum_standard "
+            "(spectrum_standard_id, spectrum_name, batch_standard_id) VALUES "
+            f"({to_sql_literal(spectrum_standard_id)}, {to_sql_literal(spectrum_name)}, {to_sql_literal(batch_standard_id)});"
+        ),
+    ]
+
+    next_data_id = spectrum_data_standard_start_id
+    for _, row in spectrum_df.iterrows():
+        sql_lines.append(
+            "INSERT INTO spectrum_data_standard "
+            "(spectrum_data_standard_id, spectrum_standard_id, wavenumber, intensity) VALUES "
+            f"({to_sql_literal(next_data_id)}, {to_sql_literal(spectrum_standard_id)}, {to_sql_literal(row[0])}, {to_sql_literal(row[1])});"
+        )
+        next_data_id += 1
+
+    sql_lines.append("COMMIT;")
+    return "\n".join(sql_lines)
+
+def save_sql_dump_and_stage(sql_text, dump_id, source_filename):
+    sql_dump_dir = "sql_dumps"
+    cloud_stage_dir = "cloud_stage"
+    os.makedirs(sql_dump_dir, exist_ok=True)
+    os.makedirs(cloud_stage_dir, exist_ok=True)
+
+    safe_filename = os.path.basename(source_filename).replace(" ", "_")
+    dump_filename = f"{dump_id}_{safe_filename}.sql"
+    dump_path = os.path.join(sql_dump_dir, dump_filename)
+    with open(dump_path, "w", encoding="utf-8") as f:
+        f.write(sql_text)
+
+    manifest_path = os.path.join(cloud_stage_dir, "pending_uploads_manifest.tsv")
+    with open(manifest_path, "a", encoding="utf-8") as f:
+        f.write(
+            f"{datetime.datetime.utcnow().isoformat()}\t{dump_id}\t{dump_path}\tPENDING_UPLOAD\n"
+        )
+
+    return dump_path, manifest_path
 
 def compute_relevance(row, keywords):
     return sum(
@@ -665,71 +730,100 @@ try:
                 st.session_state.uploaded_files = st.file_uploader(
                     "Choose a CSV file", accept_multiple_files=False, type=['csv']
                 )
+                upload_mode = st.radio(
+                    "How should this upload be handled?",
+                    options=[
+                        "Generate SQL dump only (do not insert into DB)",
+                        "Insert into DB and also generate SQL dump"
+                    ],
+                    index=0
+                )
+                default_batch_standard_id = int(st.session_state.get("new_batch_id", 1))
+                target_batch_standard_id = st.number_input(
+                    "Target batch_standard_id for dump/export",
+                    min_value=1,
+                    value=default_batch_standard_id,
+                    step=1
+                )
                 new_data_insert_submitted = st.form_submit_button("submit")
             if new_data_insert_submitted:
-                if st.session_state.uploaded_files is not None:
-    # Load the file as a DataFrame, assuming no header
+                if st.session_state.uploaded_files is None:
+                    st.error("Please upload a CSV file before submitting.")
+                else:
                     try:
                         df = pd.read_csv(st.session_state.uploaded_files, header=None)
-                        
-                        # Check if there are exactly 2 columns
                         if df.shape[1] != 2:
                             st.error("The file must have exactly two columns.")
                         else:
-                            # Check if all values are numeric
-                            if df.applymap(lambda x: isinstance(x, (int, float))).all().all():
-                                st.success("File is valid and all checks passed!")
-                                st.write(df)  # Optionally display the data
+                            # Force numeric conversion to guarantee schema-safe inserts.
+                            df[0] = pd.to_numeric(df[0], errors="raise")
+                            df[1] = pd.to_numeric(df[1], errors="raise")
+
+                            st.success("File is valid and all checks passed!")
+                            st.write(df)
+
+                            dump_id = f"dump_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+                            spectrum_standard_name = st.session_state.uploaded_files.name
+
+                            if upload_mode == "Insert into DB and also generate SQL dump":
+                                conn = psycopg2.connect(
+                                    dbname="SpectraGuruDB",
+                                    user=st.session_state.user,
+                                    password=st.session_state.passkey,
+                                    host="localhost",
+                                    port="5432"
+                                )
+                                cur = conn.cursor()
+
+                                cur.execute('SELECT COALESCE(MAX("spectrum_standard_id"), 0) FROM "spectrum_standard"')
+                                spectrum_standard_id = int(cur.fetchone()[0]) + 1
+
+                                cur.execute('SELECT COALESCE(MAX("spectrum_data_standard_id"), 0) FROM "spectrum_data_standard"')
+                                spectrum_data_standard_id = int(cur.fetchone()[0]) + 1
+
+                                cur.execute(
+                                    "INSERT INTO spectrum_standard (spectrum_standard_id, spectrum_name, batch_standard_id) VALUES (%s, %s, %s);",
+                                    (spectrum_standard_id, spectrum_standard_name, int(target_batch_standard_id))
+                                )
+                                for _, row in df.iterrows():
+                                    cur.execute(
+                                        "INSERT INTO spectrum_data_standard (spectrum_data_standard_id, spectrum_standard_id, wavenumber, intensity) VALUES (%s, %s, %s, %s);",
+                                        (int(spectrum_data_standard_id), int(spectrum_standard_id), float(row[0]), float(row[1]))
+                                    )
+                                    spectrum_data_standard_id += 1
+
+                                conn.commit()
+                                st.success("Data inserted into DB successfully.")
                             else:
-                                st.error("The file contains non-numeric values.")
-                                
+                                spectrum_standard_id = int(datetime.datetime.utcnow().timestamp())
+                                spectrum_data_standard_id = spectrum_standard_id + 1
+                                st.info("DB insert skipped (dump-only mode).")
+
+                            sql_dump_text = build_spectrum_dump_sql(
+                                dump_id=dump_id,
+                                batch_standard_id=int(target_batch_standard_id),
+                                spectrum_standard_id=int(spectrum_standard_id),
+                                spectrum_data_standard_start_id=int(spectrum_data_standard_id),
+                                spectrum_name=spectrum_standard_name,
+                                spectrum_df=df
+                            )
+                            dump_path, manifest_path = save_sql_dump_and_stage(
+                                sql_text=sql_dump_text,
+                                dump_id=dump_id,
+                                source_filename=spectrum_standard_name
+                            )
+
+                            st.success(f"SQL dump generated with id: {dump_id}")
+                            st.write(f"Saved dump file: {dump_path}")
+                            st.write(f"Cloud staging manifest updated: {manifest_path}")
+                            st.download_button(
+                                "Download SQL dump",
+                                data=sql_dump_text,
+                                file_name=os.path.basename(dump_path),
+                                mime="application/sql"
+                            )
                     except Exception as e:
                         st.error(f"An error occurred: {e}")
-                
-                conn = psycopg2.connect(
-                    dbname="SpectraGuruDB",
-                    user=st.session_state.user,
-                    password=st.session_state.passkey,
-                    host="localhost",  # Use "localhost" for local database
-                    port="5432"  # Default PostgreSQL port
-                )
-                cur = conn.cursor()
-                
-                query = 'SELECT MAX("spectrum_standard_id") FROM "spectrum_standard"'
-                cur.execute(query)
-                old_spectrum_standard_id = cur.fetchone()[0]
-                # Automatically assign spectrum_id starting from 1
-                spectrum_standard_id = int(old_spectrum_standard_id) + int(1)
-
-                st.write(spectrum_standard_id)
-                
-                query = 'SELECT MAX("spectrum_data_standard_id") FROM "spectrum_data_standard"'
-                cur.execute(query)
-                old_spectrum_data_standard_id = cur.fetchone()[0]
-                # Automatically assign spectrum_id starting from 1
-                spectrum_data_standard_id = int(old_spectrum_data_standard_id) + int(1)
-
-                st.write(spectrum_data_standard_id)
-                st.write("filename:", st.session_state.uploaded_files.name)
-                
-                spectrum_standard_name = st.session_state.uploaded_files.name  # Using the filename as the spectrum_name
-                
-                cur.execute(
-                    "INSERT INTO spectrum_standard (spectrum_standard_id, spectrum_name, batch_standard_id) VALUES (%s, %s, %s);",
-                    (spectrum_standard_id, spectrum_standard_name, st.session_state.new_batch_id)
-                )
-                for index, row in df.iterrows():
-                    wavenumber = row[0]
-                    intensity = row[1]
-
-                    cur.execute(
-                        "INSERT INTO spectrum_data_standard (spectrum_data_standard_id, spectrum_standard_id, wavenumber, intensity) VALUES (%s, %s, %s, %s);",
-                        (spectrum_data_standard_id, spectrum_standard_id, wavenumber, intensity)
-                    )
-                    spectrum_data_standard_id += 1  # Increment spectrum_data_id for each row
-
-                # Commit the changes to the database
-                conn.commit()
 
 except Exception as e: 
     pass
