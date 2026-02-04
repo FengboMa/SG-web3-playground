@@ -6,7 +6,6 @@ import pycountry
 import datetime
 import requests
 import os
-# from auth_utils import verify_clerk_session
 
 # ---- MUST COME FIRST ----
 st.set_page_config(page_title="SpectraGuru Auth Test")
@@ -20,50 +19,7 @@ st.session_state.log_file_path = r"C:\Users\zhaoy_admin\Desktop\OneDrive - Unive
 st.write("# SpectraGuru - A Spectra Analysis Application")
 st.info("SpectraGuru Database registration test page")
 
-st.title("🔬 SpectraGuru Authentication Gateway")
-
-# ---- Clerk auth gate (DISABLED for DB-only testing) ----
-# The block below previously forced users to authenticate via Clerk before
-# accessing the database UI. For local DB testing / normal DB operations,
-# we bypass it and proceed directly.
-#
-# To re-enable Clerk later:
-#   1) Uncomment the import: `from auth_utils import verify_clerk_session`
-#   2) Uncomment the block below
-#
-# # ---- Step 1: Extract token (works for both old/new Clerk redirects) ----
-# params = st.query_params
-# session_token = params.get("session") or params.get("__clerk_db_jwt")
-#
-# if "authenticated" not in st.session_state:
-#     st.session_state.authenticated = False
-#     st.session_state.user_info = None
-#
-# # ---- Step 2: Verify Clerk session ----
-# if not st.session_state.authenticated:
-#     if session_token:
-#         user_info = verify_clerk_session(session_token)
-#         if user_info:
-#             st.session_state.authenticated = True
-#             st.session_state.user_info = user_info
-#             st.success("✅ Logged in successfully via Clerk!")
-#         else:
-#             st.warning("Invalid session token. Please log in again.")
-#             st.stop()
-#     else:
-#         st.markdown("""
-#         ### Please log in via Clerk to continue
-#         [Login with Clerk](https://bright-fish-91.accounts.dev/sign-in?redirect_url=http://localhost:8880)
-#         """)
-#         st.stop()
-#
-# # ---- Step 3: Show authenticated content ----
-# user = st.session_state.user_info
-# if user:
-#     name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
-#     st.write(f"Welcome, **{name or user.get('email') or user.get('id')}** 👋")
-# else:
-#     st.warning("Could not load user info.")
+st.title("🔬 SpectraGuru Database Gateway")
 
 
 st.session_state.connection = False
